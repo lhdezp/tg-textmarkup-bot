@@ -1,4 +1,4 @@
-from tg_textmarkup_bot.rendering.model import ButtonSpec, ButtonType, Draft, Segment
+from tg_textmarkup_bot.rendering.model import ButtonSpec, Draft, Segment
 from tg_textmarkup_bot.rendering.placeholders import (
     find_placeholders,
     placeholder_in_photo,

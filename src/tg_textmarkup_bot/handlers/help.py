@@ -1,7 +1,6 @@
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
-from aiogram.types import InlineKeyboardButton
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from tg_textmarkup_bot.callbacks import EditorCB
 
@@ -101,7 +100,7 @@ async def cmd_help(message: Message) -> None:
     await message.answer(GUIDE_TEXT)
 
 
-@router.callback_query(EditorCB.filter(action="help"))
+@router.callback_query(EditorCB.filter(F.action == "help"))
 async def on_help_callback(cb: CallbackQuery) -> None:
     await cb.answer()
     await cb.message.answer(GUIDE_TEXT)  # type: ignore[union-attr]

@@ -3,7 +3,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from tg_textmarkup_bot.handlers import compose, help as help_handlers, templates
+from tg_textmarkup_bot.handlers import compose, templates
+from tg_textmarkup_bot.handlers import help as help_handlers
 
 
 def create_bot(token: str) -> Bot:

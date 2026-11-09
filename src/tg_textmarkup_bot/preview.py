@@ -3,7 +3,8 @@
 from typing import Literal
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     InlineKeyboardMarkup,
@@ -12,7 +13,6 @@ from aiogram.types import (
     InputRichMessageMedia,
     LinkPreviewOptions,
     Message,
-    ParseMode,
 )
 
 from tg_textmarkup_bot.keyboards import editor_keyboard, formats_keyboard, start_compose_keyboard
@@ -187,4 +187,31 @@ async def _try_delete(bot: Bot, chat_id: int, message_id: int) -> None:
     try:
         await bot.delete_message(chat_id, message_id)
     except TelegramBadRequest:
+        pass
+
+
+async def edit_or_send(bot: Bot, chat_id: int, message_id: int | None, text: str) -> int:
+    """Edit the tracked message in place; delete+resend as fallback.
+
+    Returns the message id to keep tracking (the edited one, or the new one).
+    """
+    if message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text, parse_mode=None
+            )
+            return message_id
+        except TelegramBadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return message_id
+            await _try_delete(bot, chat_id, message_id)
+    message = await bot.send_message(chat_id, text, parse_mode=None)
+    return message.message_id
+
+
+async def drop_user_message(bot: Bot, message: Message) -> None:
+    """Best-effort delete of the user's input message to keep the chat clean."""
+    try:
+        await bot.delete_message(message.chat.id, message.message_id)
+    except (TelegramBadRequest, TelegramNetworkError):
         pass

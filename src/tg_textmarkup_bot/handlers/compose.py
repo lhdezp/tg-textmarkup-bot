@@ -6,6 +6,7 @@ from typing import Any
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
+from aiogram.filters.state import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.exc import IntegrityError
@@ -22,7 +23,13 @@ from tg_textmarkup_bot.keyboards import (
     fragments_keyboard,
     start_compose_keyboard,
 )
-from tg_textmarkup_bot.preview import send_draft, set_keyboard, show_preview
+from tg_textmarkup_bot.preview import (
+    drop_user_message,
+    edit_or_send,
+    send_draft,
+    set_keyboard,
+    show_preview,
+)
 from tg_textmarkup_bot.rendering.model import Draft, Format, Segment
 from tg_textmarkup_bot.rendering.render import InvalidUrlError, validate_url
 from tg_textmarkup_bot.rendering.syntax import parse, parse_button_rows
@@ -60,6 +67,8 @@ TEMPLATE_NAME_ASK_TEXT = "Ponle un nombre a la plantilla (máx. 64 caracteres):"
 
 FORMATS_HINT_TEXT = "Elegí los formatos para ese fragmento en el teclado del preview 👆"
 
+EDITING_STATUS_TEXT = "✅ Listo — seguís en el editor. Tocá los botones del preview para seguir."
+
 
 def _draft_from(data: dict[str, Any]) -> Draft | None:
     raw = data.get("draft")
@@ -78,21 +87,18 @@ async def _try_delete(bot: Bot, chat_id: int, message_id: int) -> None:
 
 
 async def _ask(bot: Bot, state: FSMContext, chat_id: int, text: str) -> None:
+    """Show the next instruction by editing the persistent status message."""
     data = await state.get_data()
-    old = data.get("instr_msg_id")
-    if old:
-        await _try_delete(bot, chat_id, old)
-    message = await bot.send_message(chat_id, text, parse_mode=None)
-    await state.update_data(instr_msg_id=message.message_id)
+    message_id = await edit_or_send(bot, chat_id, data.get("instr_msg_id"), text)
+    await state.update_data(instr_msg_id=message_id)
 
 
-async def _drop_instr(bot: Bot, state: FSMContext) -> None:
+async def _edit_status(bot: Bot, state: FSMContext) -> None:
+    """Morph the instruction message back to a neutral editing status."""
     data = await state.get_data()
     chat_id = data.get("chat_id")
-    old = data.get("instr_msg_id")
-    if old and chat_id:
-        await _try_delete(bot, chat_id, old)
-    await state.update_data(instr_msg_id=None)
+    if chat_id is not None and data.get("instr_msg_id"):
+        await _ask(bot, state, chat_id, EDITING_STATUS_TEXT)
 
 
 async def _refresh_preview(bot: Bot, state: FSMContext) -> None:
@@ -123,25 +129,21 @@ async def _refresh_preview(bot: Bot, state: FSMContext) -> None:
             await state.update_data(prompt_msg_id=message.message_id)
 
 
-async def _cleanup_session(
-    bot: Bot, state: FSMContext, *, keep_preview: bool = False
-) -> None:
+async def _cleanup_session(bot: Bot, state: FSMContext) -> None:
     data = await state.get_data()
     chat_id = data.get("chat_id")
     if chat_id is None:
         return
-    keys = ["prompt_msg_id", "instr_msg_id"]
-    if not keep_preview:
-        keys.append("preview_msg_id")
-    for key in keys:
+    for key in ("prompt_msg_id", "instr_msg_id", "preview_msg_id"):
         message_id = data.get(key)
         if message_id:
             await _try_delete(bot, chat_id, message_id)
-    updates: dict[str, Any] = {"prompt_msg_id": None, "instr_msg_id": None}
-    if not keep_preview:
-        updates["preview_msg_id"] = None
-        updates["preview_mode"] = None
-    await state.update_data(**updates)
+    await state.update_data(
+        prompt_msg_id=None,
+        instr_msg_id=None,
+        preview_msg_id=None,
+        preview_mode=None,
+    )
 
 
 async def _start_new(bot: Bot, state: FSMContext, chat_id: int) -> None:
@@ -203,31 +205,31 @@ async def cmd_cancel(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.message(Compose.syntax_text, F.text)
 async def on_syntax_text(message: Message, state: FSMContext, bot: Bot) -> None:
-    await _drop_instr(bot, state)
     data = await state.get_data()
     draft = _draft_from(data) or Draft()
     segments = parse(message.text or "")
     if not segments and draft.photo is None:
-        await message.answer(
-            "No reconocí contenido — escribí algo con la sintaxis.", parse_mode=None
-        )
+        chat_id = data.get("chat_id") or message.chat.id
+        await _ask(bot, state, chat_id, f"⚠️ No reconocí contenido.\n\n{SYNTAX_ASK_TEXT}")
         return
+    await drop_user_message(bot, message)
     draft.segments = segments
     await _save_draft(state, draft)
     await state.set_state(Compose.editing)
     await state.update_data(seg_idx=-1)
     await _refresh_preview(bot, state)
+    await _edit_status(bot, state)
 
 
 @router.message(Compose.segment_text, F.text)
 async def on_segment_text(message: Message, state: FSMContext, bot: Bot) -> None:
-    await _drop_instr(bot, state)
     data = await state.get_data()
     chat_id = data["chat_id"]
     draft = _draft_from(data)
     if draft is None:
         await _start_new(bot, state, chat_id)
         return
+    await drop_user_message(bot, message)
     draft.segments.append(Segment(text=message.text or ""))
     idx = len(draft.segments) - 1
     await _save_draft(state, draft)
@@ -239,7 +241,6 @@ async def on_segment_text(message: Message, state: FSMContext, bot: Bot) -> None
 
 @router.message(Compose.segment_edit_text, F.text)
 async def on_segment_edit_text(message: Message, state: FSMContext, bot: Bot) -> None:
-    await _drop_instr(bot, state)
     data = await state.get_data()
     chat_id = data["chat_id"]
     draft = _draft_from(data)
@@ -248,6 +249,7 @@ async def on_segment_edit_text(message: Message, state: FSMContext, bot: Bot) ->
         await state.set_state(Compose.editing)
         await _refresh_preview(bot, state)
         return
+    await drop_user_message(bot, message)
     draft.segments[idx].text = message.text or ""
     await _save_draft(state, draft)
     await state.set_state(Compose.segment_formats)
@@ -257,7 +259,6 @@ async def on_segment_edit_text(message: Message, state: FSMContext, bot: Bot) ->
 
 @router.message(Compose.link_url, F.text)
 async def on_link_url(message: Message, state: FSMContext, bot: Bot) -> None:
-    await _drop_instr(bot, state)
     data = await state.get_data()
     chat_id = data["chat_id"]
     draft = _draft_from(data)
@@ -270,8 +271,9 @@ async def on_link_url(message: Message, state: FSMContext, bot: Bot) -> None:
     try:
         validate_url(url)
     except InvalidUrlError as exc:
-        await _ask(bot, state, chat_id, f"⚠️ {exc}\nPasame una URL válida:")
+        await _ask(bot, state, chat_id, f"⚠️ {exc}\n\n{LINK_ASK_TEXT}")
         return
+    await drop_user_message(bot, message)
     draft.segments[idx].link_url = url
     await _save_draft(state, draft)
     await state.set_state(Compose.segment_formats)
@@ -281,18 +283,18 @@ async def on_link_url(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.message(Compose.photo, F.photo)
 async def on_photo_uploaded(message: Message, state: FSMContext, bot: Bot) -> None:
-    await _drop_instr(bot, state)
     data = await state.get_data()
     draft = _draft_from(data) or Draft()
+    await drop_user_message(bot, message)
     draft.photo = message.photo[-1].file_id
     await _save_draft(state, draft)
     await state.set_state(Compose.editing)
     await _refresh_preview(bot, state)
+    await _edit_status(bot, state)
 
 
 @router.message(Compose.photo, F.text)
 async def on_photo_url(message: Message, state: FSMContext, bot: Bot) -> None:
-    await _drop_instr(bot, state)
     data = await state.get_data()
     chat_id = data["chat_id"]
     url = (message.text or "").strip()
@@ -305,33 +307,37 @@ async def on_photo_url(message: Message, state: FSMContext, bot: Bot) -> None:
             "O enviame la foto directamente.",
         )
         return
+    await drop_user_message(bot, message)
     draft = _draft_from(data) or Draft()
     draft.photo = url
     await _save_draft(state, draft)
     await state.set_state(Compose.editing)
     await _refresh_preview(bot, state)
+    await _edit_status(bot, state)
 
 
 @router.message(Compose.inline_buttons, F.text)
 async def on_inline_buttons(message: Message, state: FSMContext, bot: Bot) -> None:
-    await _drop_instr(bot, state)
     data = await state.get_data()
     chat_id = data["chat_id"]
     try:
         rows = parse_button_rows(message.text or "")
     except ValueError as exc:
-        await _ask(bot, state, chat_id, f"⚠️ {exc}\nProbá de nuevo con el formato:")
+        await _ask(
+            bot, state, chat_id, f"⚠️ {exc}\n\n{BUTTONS_ASK_TEXT}"
+        )
         return
+    await drop_user_message(bot, message)
     draft = _draft_from(data) or Draft()
     draft.inline_buttons = rows
     await _save_draft(state, draft)
     await state.set_state(Compose.editing)
     await _refresh_preview(bot, state)
+    await _edit_status(bot, state)
 
 
 @router.message(Compose.template_name, F.text)
 async def on_template_name(message: Message, state: FSMContext, bot: Bot) -> None:
-    await _drop_instr(bot, state)
     data = await state.get_data()
     chat_id = data["chat_id"]
     name = (message.text or "").strip()[:64]
@@ -372,9 +378,13 @@ async def on_template_name(message: Message, state: FSMContext, bot: Bot) -> Non
                 f"⚠️ Ya tenés una plantilla llamada «{name}». Probá con otro nombre:",
             )
             return
+    await drop_user_message(bot, message)
     await state.set_state(Compose.editing)
-    await message.answer(
-        f"💾 Plantilla «{name}» guardada. Usala con /plantillas.", parse_mode=None
+    await _ask(
+        bot,
+        state,
+        chat_id,
+        f"💾 Plantilla «{name}» guardada. Usala con /plantillas.",
     )
 
 
@@ -383,16 +393,18 @@ async def on_template_name(message: Message, state: FSMContext, bot: Bot) -> Non
 # ---------------------------------------------------------------------------
 
 
-@router.message(F.photo, state=None)
+@router.message(F.photo, StateFilter(None))
 async def on_free_photo(message: Message, state: FSMContext, bot: Bot) -> None:
     draft = Draft(photo=message.photo[-1].file_id)
+    await drop_user_message(bot, message)
     await _begin_draft(state, message.chat.id, draft)
     await _refresh_preview(bot, state)
 
 
-@router.message(F.text, state=None)
+@router.message(F.text, StateFilter(None))
 async def on_free_text(message: Message, state: FSMContext, bot: Bot) -> None:
     draft = Draft(segments=parse(message.text or ""))
+    await drop_user_message(bot, message)
     await _begin_draft(state, message.chat.id, draft)
     await _refresh_preview(bot, state)
 
@@ -462,6 +474,7 @@ async def _action_back(
     await state.set_state(Compose.editing)
     await state.update_data(seg_idx=-1)
     await set_keyboard(bot, state, editor_keyboard(draft))
+    await _edit_status(bot, state)
 
 
 async def _action_fragments(
@@ -736,28 +749,16 @@ async def _action_send(
         await cb.answer(f"⚠️ {exc}"[:180], show_alert=True)
         return
 
-    prev_id = data.get("preview_msg_id")
-    sent = False
-    if prev_id:
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=chat_id, message_id=prev_id, reply_markup=keyboard
-            )
-            sent = True
-        except TelegramBadRequest:
-            sent = False
-    if not sent:
-        if prev_id:
-            await _try_delete(bot, chat_id, prev_id)
-        try:
-            await send_draft(bot, chat_id, draft, reply_markup=keyboard)
-        except (TelegramBadRequest, InvalidUrlError) as exc:
-            await cb.answer(f"⚠️ {exc}"[:180], show_alert=True)
-            return
+    try:
+        await send_draft(bot, chat_id, draft, reply_markup=keyboard)
+    except (TelegramBadRequest, InvalidUrlError) as exc:
+        await cb.answer(f"⚠️ {exc}"[:180], show_alert=True)
+        return
 
-    await _cleanup_session(bot, state, keep_preview=True)
-    await state.clear()
-    await cb.answer("✅ Listo — el mensaje está arriba. Reenvialo a donde quieras.")
+    # The editor session stays alive: preview, draft and state are untouched,
+    # so the user can keep editing and send again.
+    await state.set_state(Compose.editing)
+    await cb.answer("✅ Enviado — el editor sigue activo. Seguí editando y volvé a enviar cuando quieras.")
 
 
 async def _action_cancel(
@@ -836,9 +837,15 @@ async def on_demo_callback(cb: CallbackQuery) -> None:
 
 
 @router.message()
-async def on_unhandled(message: Message, state: FSMContext) -> None:
-    if await state.get_state() is not None:
-        await message.answer(
-            "Esperaba texto o una foto. Usá los botones del teclado o /cancelar.",
-            parse_mode=None,
-        )
+async def on_unhandled(message: Message, state: FSMContext, bot: Bot) -> None:
+    if await state.get_state() is None:
+        return
+    data = await state.get_data()
+    chat_id = data.get("chat_id") or message.chat.id
+    await drop_user_message(bot, message)
+    await _ask(
+        bot,
+        state,
+        chat_id,
+        "⚠️ Esperaba texto o una foto. Usá los botones del teclado o /cancelar.",
+    )

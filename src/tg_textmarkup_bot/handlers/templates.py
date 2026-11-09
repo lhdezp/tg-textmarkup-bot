@@ -11,12 +11,11 @@ from aiogram.types import (
     Message,
 )
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 
 from tg_textmarkup_bot.callbacks import EditorCB, TemplateCB
 from tg_textmarkup_bot.db.engine import get_session_factory
 from tg_textmarkup_bot.db.models import Template
-from tg_textmarkup_bot.preview import show_preview
+from tg_textmarkup_bot.preview import drop_user_message, edit_or_send, show_preview
 from tg_textmarkup_bot.rendering.model import ButtonSpec, Draft, Segment
 from tg_textmarkup_bot.rendering.placeholders import find_placeholders, substitute
 from tg_textmarkup_bot.rendering.render import InvalidUrlError
@@ -102,6 +101,28 @@ async def _clear_compose_messages(bot: Bot, state: FSMContext) -> None:
     )
 
 
+async def _delete_message(bot: Bot, chat_id: int, message_id: int | None) -> None:
+    if not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except TelegramBadRequest:
+        pass
+
+
+async def _ask_question(bot: Bot, state: FSMContext, chat_id: int, text: str) -> None:
+    """Ask the next placeholder value by editing the persistent question message."""
+    data = await state.get_data()
+    message_id = await edit_or_send(bot, chat_id, data.get("question_msg_id"), text)
+    await state.update_data(question_msg_id=message_id)
+
+
+async def _ask(bot: Bot, state: FSMContext, chat_id: int, text: str) -> None:
+    data = await state.get_data()
+    message_id = await edit_or_send(bot, chat_id, data.get("instr_msg_id"), text)
+    await state.update_data(instr_msg_id=message_id)
+
+
 async def _load_into_compose(
     bot: Bot, state: FSMContext, chat_id: int, draft: Draft, name: str
 ) -> None:
@@ -126,10 +147,11 @@ async def _load_into_compose(
     except (InvalidUrlError, TelegramBadRequest) as exc:
         await bot.send_message(chat_id, f"⚠️ {exc}", parse_mode=None)
         return
-    await bot.send_message(
+    await _ask(
+        bot,
+        state,
         chat_id,
         f"✅ Plantilla «{name}» lista — tocá ✅ Enviar o seguí editando.",
-        parse_mode=None,
     )
 
 
@@ -139,7 +161,7 @@ async def cmd_templates(message: Message, bot: Bot) -> None:
     await message.answer(text, reply_markup=keyboard, parse_mode=None)
 
 
-@router.callback_query(EditorCB.filter(action="menu_templates"))
+@router.callback_query(EditorCB.filter(F.action == "menu_templates"))
 async def on_menu_templates(cb: CallbackQuery, bot: Bot) -> None:
     await cb.answer()
     if cb.message is None:
@@ -150,7 +172,7 @@ async def on_menu_templates(cb: CallbackQuery, bot: Bot) -> None:
     )
 
 
-@router.callback_query(TemplateCB.filter(action="use"))
+@router.callback_query(TemplateCB.filter(F.action == "use"))
 async def on_template_use(
     cb: CallbackQuery, callback_data: TemplateCB, state: FSMContext, bot: Bot
 ) -> None:
@@ -198,14 +220,7 @@ async def on_placeholder_value(
 ) -> None:
     data = await state.get_data()
     chat_id = data["chat_id"]
-    question_id = data.get("question_msg_id")
-    if question_id:
-        try:
-            await bot.delete_message(chat_id, question_id)
-        except TelegramBadRequest:
-            pass
-
-    names: list[str] = data["tpl_names"]
+    names: list[str] = list(data["tpl_names"])
     values: dict[str, str] = dict(data.get("tpl_values") or {})
     total: int = data.get("tpl_total", len(names))
     current = names[0]
@@ -215,42 +230,44 @@ async def on_placeholder_value(
         if f"{{{current}}}" in photo_field:
             values[current] = message.photo[-1].file_id
         else:
-            follow = await bot.send_message(
+            await _ask_question(
+                bot,
+                state,
                 chat_id,
                 f"⚠️ {{{current}}} va en el texto, no es una foto. Mandame el valor:",
-                parse_mode=None,
             )
-            await state.update_data(question_msg_id=follow.message_id)
             return
     elif message.text:
         values[current] = message.text
     else:
-        follow = await bot.send_message(
+        await _ask_question(
+            bot,
+            state,
             chat_id,
             f"⚠️ Esperaba un texto para {{{current}}}:",
-            parse_mode=None,
         )
-        await state.update_data(question_msg_id=follow.message_id)
         return
 
+    await drop_user_message(bot, message)
     names = names[1:]
     if names:
         answered = total - len(names)
-        follow = await bot.send_message(
+        await state.update_data(tpl_names=names, tpl_values=values)
+        await _ask_question(
+            bot,
+            state,
             chat_id,
             f"Valor para {{{names[0]}}} ({answered + 1}/{total}):",
-            parse_mode=None,
-        )
-        await state.update_data(
-            tpl_names=names, tpl_values=values, question_msg_id=follow.message_id
         )
         return
 
+    await _delete_message(bot, chat_id, data.get("question_msg_id"))
+    await state.update_data(question_msg_id=None)
     draft = substitute(Draft.model_validate(data["tpl_draft"]), values)
     await _load_into_compose(bot, state, chat_id, draft, data.get("tpl_name", "plantilla"))
 
 
-@router.callback_query(TemplateCB.filter(action="del"))
+@router.callback_query(TemplateCB.filter(F.action == "del"))
 async def on_template_del(
     cb: CallbackQuery, callback_data: TemplateCB, state: FSMContext, bot: Bot
 ) -> None:
@@ -283,7 +300,7 @@ async def on_template_del(
         pass
 
 
-@router.callback_query(TemplateCB.filter(action="confirm_del"))
+@router.callback_query(TemplateCB.filter(F.action == "confirm_del"))
 async def on_template_confirm_del(
     cb: CallbackQuery, callback_data: TemplateCB, state: FSMContext, bot: Bot
 ) -> None:
@@ -305,7 +322,7 @@ async def on_template_confirm_del(
         pass
 
 
-@router.callback_query(TemplateCB.filter(action="back"))
+@router.callback_query(TemplateCB.filter(F.action == "back"))
 async def on_template_back(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await cb.answer()
     if cb.message is None:
